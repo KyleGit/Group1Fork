@@ -1,13 +1,19 @@
-version: '3'
 services:
-
-  # Build app from Dockerfile in same folder
   app:
     build: .
+    command: ["db:3306", "1000"]
+    depends_on:
+      db:
+        condition: service_healthy
 
-  # Build the db as name db from the Dockerfile in the db folder
-  # exposing the port if we want to run code outside a container
   db:
-    build: db/.
+    build: ./db
     ports:
       - "33060:3306"
+    healthcheck:
+      # Check seeded data too: an open port alone does not mean imports finished.
+      test: ["CMD-SHELL", "MYSQL_PWD=example mysql -h 127.0.0.1 -uroot -Dworld -Nse 'SELECT COUNT(*) FROM country' | grep -qx 239"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
