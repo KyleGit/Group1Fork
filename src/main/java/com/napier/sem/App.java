@@ -1,22 +1,46 @@
 package com.napier.sem;
 
-import java.sql.*;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Objects;
 
-/**
- * Application to generate various reports from the world database
- */
-public class App
-{
+/** Generates population reports from the supplied world database. */
+public class App {
+    private Connection con;
+
+    public App() {
+    }
+
+    // Allows database-independent tests to exercise JDBC resource handling.
+    App(Connection connection) {
+        con = connection;
+    }
+
     /**
-     * Main method, to connect disconnect and run the various reports from.
-     * @param args -
+     * Runs the existing demonstration reports.
+     * @param args optional database host:port and retry delay in milliseconds
      */
-    public static void main(String[] args)
-    {
+    public static void main(String[] args) {
+        if (args.length > 2) {
+            throw new IllegalArgumentException("Usage: java -jar semApp.jar [host:port] [retry-delay-ms]");
+        }
+        String address = args.length > 0 ? args[0] : environment("DB_ADDRESS", "db:3306");
+        int delay = args.length > 1 ? Integer.parseInt(args[1]) : 1000;
         App a = new App();
-        a.connect();
+        try {
+            a.connect(address, delay);
+            a.runReports();
+        } finally {
+            a.disconnect();
+        }
+    }
 
+    private void runReports() {
+        App a = this;
         // Gets and prints all countries in the world
         ArrayList<Country> allCountries = a.getAllCountries();
         a.printCountries(allCountries);
@@ -132,1068 +156,371 @@ public class App
         ArrayList<City> topCapRegionCities = a.getTopCapCitiesByRegion(uNCapCityRegion, n11);
         a.printCapCities(topCapRegionCities);
 
-        a.disconnect();
+    }
+
+    /** Connects using DB_ADDRESS, or the Docker database service by default. */
+    public void connect() {
+        connect(environment("DB_ADDRESS", "db:3306"), 1000);
     }
 
     /**
-     * Connection to MySQL database.
+     * Connects to the world database, retrying while the database starts.
+     * DB_USER and DB_PASSWORD override the demonstration credentials.
+     * @param location database host:port, for example localhost:33060
+     * @param delayMillis delay between failed attempts; zero retries immediately
      */
-    private Connection con = null;
+    public void connect(String location, int delayMillis) {
+        connect(location, delayMillis, 30);
+    }
 
-    /**
-     * Connect to the MySQL database.
-     */
-    public void connect()
-    {
-        try
-        {
-            // Load Database driver
+    void connect(String location, int delayMillis, int attempts) {
+        requireFilter(location, "Database address");
+        if (!location.matches("[A-Za-z0-9._-]+:[0-9]{1,5}")) {
+            throw new IllegalArgumentException("Database address must be host:port");
+        }
+        int port = Integer.parseInt(location.substring(location.lastIndexOf(':') + 1));
+        if (port < 1 || port > 65535 || delayMillis < 0 || attempts < 1) {
+            throw new IllegalArgumentException("Invalid database port, retry delay, or attempt count");
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            throw new IllegalStateException("Database connection interrupted");
+        }
+        try {
             Class.forName("com.mysql.cj.jdbc.Driver");
-        }
-        catch (ClassNotFoundException e)
-        {
-            System.out.println("Could not load SQL driver");
-            System.exit(-1);
+        } catch (ClassNotFoundException e) {
+            throw new IllegalStateException("Could not load MySQL driver", e);
         }
 
-        // Connection to the database
-        int retries = 100;
-        for (int i = 0; i < retries; ++i)
-        {
-            System.out.println("Connecting to database...");
-            try
-            {
-                // Wait a bit for db to start
-                Thread.sleep(1000);
-                // Connect to database
-                con = DriverManager.getConnection("jdbc:mysql://db:3306/world?useSSL=false&allowPublicKeyRetrieval=true", "root", "example");
-                System.out.println("Successfully connected");
-                // Wait a bit
-                Thread.sleep(1000);
-                // Exit for loop
-                break;
+        disconnect();
+        SQLException failure = null;
+        String url = "jdbc:mysql://" + location
+                + "/world?useSSL=false&allowPublicKeyRetrieval=true&connectTimeout=5000&socketTimeout=30000";
+        for (int attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                con = DriverManager.getConnection(url,
+                        environment("DB_USER", "root"), environment("DB_PASSWORD", "example"));
+                return;
+            } catch (SQLException e) {
+                failure = e;
+                if (attempt < attempts) {
+                    try {
+                        Thread.sleep(delayMillis);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("Database connection interrupted", interrupted);
+                    }
+                }
             }
-            catch (SQLException sqle)
-            {
-                System.out.println("Failed to connect to database attempt " + i);
-                System.out.println(sqle.getMessage());
-            }
-            catch (InterruptedException ie)
-            {
-                System.out.println("Thread interrupted? Should not happen.");
+        }
+        throw new IllegalStateException("Could not connect to database at " + location
+                + " after " + attempts + " attempts", failure);
+    }
+
+    private static String environment(String name, String fallback) {
+        String value = System.getenv(name);
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    /** Closes the connection. Calling this again is safe. */
+    public void disconnect() {
+        if (con != null) {
+            Connection connection = con;
+            con = null;
+            try {
+                connection.close();
+            } catch (SQLException e) {
+                throw new IllegalStateException("Could not close database connection", e);
             }
         }
     }
 
-    /**
-     * Disconnect from the MySQL database.
-     */
-    public void disconnect()
-    {
-        if (con != null)
-        {
-            try
-            {
-                // Close connection
-                con.close();
-            }
-            catch (Exception e)
-            {
-                System.out.println("Error closing connection to database");
-            }
+    /** All report filters must identify a nonempty place. */
+    private static String requireFilter(String value, String name) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(name + " must not be null or blank");
         }
+        return value;
     }
 
-    /**
-     * Retrieves details for all countries in the world and stores them in an ArrayList.
-     * @return countries
-     */
+    /** A top-N report requires at least one row. */
+    private static int requireLimit(Integer n) {
+        if (n == null || n <= 0) {
+            throw new IllegalArgumentException("Number of results must be positive");
+        }
+        return n;
+    }
+
+    private static final String COUNTRY_SELECT =
+            "SELECT country.Code, country.Name, country.Continent, country.Region, "
+            + "country.Population, city.Name AS Capital FROM country "
+            + "LEFT JOIN city ON city.ID = country.Capital ";
+
+    private static final String CITY_SELECT =
+            "SELECT city.Name, country.Name AS Country_name, city.District, city.Population "
+            + "FROM city JOIN country ON city.CountryCode = country.Code ";
+
+    private static final String CAPITAL_SELECT =
+            "SELECT city.Name, country.Name AS Country_name, city.District, city.Population "
+            + "FROM city JOIN country ON city.ID = country.Capital ";
+
+    /** Returns all countries in the world, ordered by descending population. */
     public ArrayList<Country> getAllCountries() {
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT country.Code, country.Name, country.Continent, country.Region, country.Population, city.Name AS Capital " +
-                    "FROM country " +
-                    "JOIN city ON city.ID = country.Capital " +
-                    "ORDER BY country.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<Country> countries = new ArrayList<>();
-            while (rset.next()) {
-                Country country = new Country();
-                country.code = rset.getString("Code");
-                country.name = rset.getString("Name");
-                country.continent = rset.getString("Continent");
-                country.region = rset.getString("Region");
-                country.population = rset.getInt("Population");
-                country.capital = rset.getString("Capital");
-                countries.add(country);
-            }
-            return countries;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get country details.");
-            return null;
-        }
+        return query(COUNTRY_SELECT + "ORDER BY country.Population DESC, country.Code",
+                App::readCountry);
     }
 
-    /**
-     * Retrieves details for all countries in specified continent and stores them in an ArrayList.
-     * @param continent - String for continent to filter by
-     * @return countries
-     */
+    /** Returns countries in a continent, ordered by descending population. */
     public ArrayList<Country> getCountriesByContinent(String continent) {
-        if(continent == null)
-        {
-            System.out.println("Continent is null");
-            return null;
-        }
-
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT country.Code, country.Name, country.Continent, country.Region, country.Population, city.Name AS Capital " +
-                    "FROM country " +
-                    "JOIN city ON city.ID = country.Capital " +
-                    "WHERE country.Continent = '" + continent + "' " +
-                    "ORDER BY country.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<Country> countries = new ArrayList<>();
-            while (rset.next()) {
-                Country country = new Country();
-                country.code = rset.getString("Code");
-                country.name = rset.getString("Name");
-                country.continent = rset.getString("Continent");
-                country.region = rset.getString("Region");
-                country.population = rset.getInt("Population");
-                country.capital = rset.getString("Capital");
-                countries.add(country);
-            }
-            return countries;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get country details.");
-            return null;
-        }
+        requireFilter(continent, "Continent");
+        return query(COUNTRY_SELECT + "WHERE country.Continent = ? " + "ORDER BY country.Population DESC, country.Code",
+                App::readCountry, continent);
     }
 
-    /**
-     * Retrieves details for all countries for specified region and stores them in an ArrayList.
-     * @param region - String for region to filter by
-     * @return countries
-     */
+    /** Returns countries in a region, ordered by descending population. */
     public ArrayList<Country> getCountriesByRegion(String region) {
-        if(region == null)
-        {
-            System.out.println("Region is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT country.Code, country.Name, country.Continent, country.Region, country.Population, city.Name AS Capital " +
-                    "FROM country " +
-                    "JOIN city ON city.ID = country.Capital " +
-                    "WHERE country.Region = '" + region + "' " +
-                    "ORDER BY country.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<Country> countries = new ArrayList<>();
-            while (rset.next()) {
-                Country country = new Country();
-                country.code = rset.getString("Code");
-                country.name = rset.getString("Name");
-                country.continent = rset.getString("Continent");
-                country.region = rset.getString("Region");
-                country.population = rset.getInt("Population");
-                country.capital = rset.getString("Capital");
-                countries.add(country);
-            }
-            return countries;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get country details.");
-            return null;
-        }
+        requireFilter(region, "Region");
+        return query(COUNTRY_SELECT + "WHERE country.Region = ? " + "ORDER BY country.Population DESC, country.Code",
+                App::readCountry, region);
     }
 
-    /**
-     * Returns ArrayList of top 'n' countries in the world
-     * @param n the number of countries to print
-     * @return countries
-     */
+    /** Returns the top N countries in the world, ordered by descending population. */
     public ArrayList<Country> getTopCountries(Integer n) {
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT country.Code, country.Name, country.Continent, country.Region, country.Population, city.Name AS Capital " +
-                    "FROM country " +
-                    "JOIN city ON city.ID = country.Capital " +
-                    "ORDER BY country.Population DESC " +
-                    "LIMIT " + n;
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<Country> countries = new ArrayList<>();
-            while (rset.next()) {
-                Country country = new Country();
-                country.code = rset.getString("Code");
-                country.name = rset.getString("Name");
-                country.continent = rset.getString("Continent");
-                country.region = rset.getString("Region");
-                country.population = rset.getInt("Population");
-                country.capital = rset.getString("Capital");
-                countries.add(country);
-            }
-            return countries;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get country details.");
-            return null;
-        }
+        requireLimit(n);
+        return query(COUNTRY_SELECT + "ORDER BY country.Population DESC, country.Code LIMIT ?",
+                App::readCountry, n);
     }
 
-    /**
-     * Returns ArrayList of top 'n' countries in specified continent
-     * @param n - Number of countries to get
-     * @param continent - String for continent to filter by
-     * @return countries
-     */
+    /** Returns the top N countries in a continent, ordered by descending population. */
     public ArrayList<Country> getTopCountriesByContinent(String continent, Integer n) {
-        if(continent == null)
-        {
-            System.out.println("Continent is null");
-            return null;
-        }
-
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT country.Code, country.Name, country.Continent, country.Region, country.Population, city.Name AS Capital " +
-                    "FROM country " +
-                    "JOIN city ON city.ID = country.Capital " +
-                    "WHERE country.Continent = '" + continent + "' " +
-                    "ORDER BY country.Population DESC " +
-                    "LIMIT " + n;
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<Country> countries = new ArrayList<>();
-            while (rset.next()) {
-                Country country = new Country();
-                country.code = rset.getString("Code");
-                country.name = rset.getString("Name");
-                country.continent = rset.getString("Continent");
-                country.region = rset.getString("Region");
-                country.population = rset.getInt("Population");
-                country.capital = rset.getString("Capital");
-                countries.add(country);
-            }
-            return countries;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get country details.");
-            return null;
-        }
+        requireFilter(continent, "Continent");
+        requireLimit(n);
+        return query(COUNTRY_SELECT + "WHERE country.Continent = ? " + "ORDER BY country.Population DESC, country.Code LIMIT ?",
+                App::readCountry, continent, n);
     }
 
-    /**
-     * Returns ArrayList of top 'n' countries in specified region
-     * @param n - Number of countries to get
-     * @param region - String for region to filter by
-     * @return countries
-     */
+    /** Returns the top N countries in a region, ordered by descending population. */
     public ArrayList<Country> getTopCountriesByRegion(String region, Integer n) {
-        if(region == null)
-        {
-            System.out.println("Region is null");
-            return null;
-        }
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT country.Code, country.Name, country.Continent, country.Region, country.Population, city.Name AS Capital " +
-                    "FROM country " +
-                    "JOIN city ON city.ID = country.Capital " +
-                    "WHERE country.Region = '" + region + "' " +
-                    "ORDER BY country.Population DESC " +
-                    "LIMIT " + n;
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<Country> countries = new ArrayList<>();
-            while (rset.next()) {
-                Country country = new Country();
-                country.code = rset.getString("Code");
-                country.name = rset.getString("Name");
-                country.continent = rset.getString("Continent");
-                country.region = rset.getString("Region");
-                country.population = rset.getInt("Population");
-                country.capital = rset.getString("Capital");
-                countries.add(country);
-            }
-            return countries;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get country details.");
-            return null;
-        }
+        requireFilter(region, "Region");
+        requireLimit(n);
+        return query(COUNTRY_SELECT + "WHERE country.Region = ? " + "ORDER BY country.Population DESC, country.Code LIMIT ?",
+                App::readCountry, region, n);
     }
 
-    /**
-     * Prints a list of countries.
-     * @param countries The list of countries to print.
-     */
-    public void printCountries(ArrayList<Country> countries) {
-        // Check countries is not null.
-        if (countries == null) {
-            System.out.println("No countries in list.");
-            return;
-        }
-        else if(countries.isEmpty())
-        {
-            System.out.println("No countries in list.");
-            return;
-        }
-
-        // Print header.
-        System.out.println(String.format("%-8s %-40s %-15s %-30s %-15s %-10s", "Code", "Name", "Continent", "Region", "Population", "Capital"));
-
-        // Loop over all countries in the list.
-        for (Country country : countries) {
-            if (country == null)
-                continue;
-
-            String country_string = String.format("%-8s %-40s %-15s %-30s %-15s %-10s",
-                    country.code, country.name, country.continent, country.region, country.population, country.capital);
-            System.out.println(country_string);
-        }
-    }
-
-    /**
-     * Retrieves details for all cities in the world and stores them in an ArrayList.
-     * @return cities
-     */
+    /** Returns all cities in the world, ordered by descending population. */
     public ArrayList<City> getAllCities() {
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "ORDER BY city.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        return query(CITY_SELECT + "ORDER BY city.Population DESC, city.ID",
+                App::readCity);
     }
 
-    /**
-     * Retrieves details for all cities in a continent and stores them in an ArrayList.
-     * @param continent - the continent to filter by
-     * @return cities
-     */
+    /** Returns cities in a continent, ordered by descending population. */
     public ArrayList<City> getCitiesByContinent(String continent) {
-        if(continent == null)
-        {
-            System.out.println("Continent is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "WHERE country.Continent = '" + continent + "' " +
-                    "ORDER BY city.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(continent, "Continent");
+        return query(CITY_SELECT + "WHERE country.Continent = ? " + "ORDER BY city.Population DESC, city.ID",
+                App::readCity, continent);
     }
 
-    /**
-     * Retrieves details for all cities in a region and stores them in an ArrayList.
-     * @param region - the continent to filter by
-     * @return cities
-     */
+    /** Returns cities in a region, ordered by descending population. */
     public ArrayList<City> getCitiesByRegion(String region) {
-        if(region == null)
-        {
-            System.out.println("Region is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "WHERE country.Region = '" + region + "' " +
-                    "ORDER BY city.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(region, "Region");
+        return query(CITY_SELECT + "WHERE country.Region = ? " + "ORDER BY city.Population DESC, city.ID",
+                App::readCity, region);
     }
 
-    /**
-     * Retrieves details for all cities in a country and stores them in an ArrayList.
-     * @param country - the continent to filter by
-     * @return cities
-     */
+    /** Returns cities in a country, ordered by descending population. */
     public ArrayList<City> getCitiesByCountry(String country) {
-        if(country == null)
-        {
-            System.out.println("Country is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "WHERE country.Name = '" + country + "' " +
-                    "ORDER BY city.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(country, "Country");
+        return query(CITY_SELECT + "WHERE country.Name = ? " + "ORDER BY city.Population DESC, city.ID",
+                App::readCity, country);
     }
 
-    /**
-     * Retrieves details for all cities in a district and stores them in an ArrayList.
-     * @param district - the continent to filter by
-     * @return cities
-     */
+    /** Returns cities in a district, ordered by descending population. */
     public ArrayList<City> getCitiesByDistrict(String district) {
-        if(district == null)
-        {
-            System.out.println("District is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "WHERE city.District = '" + district + "' " +
-                    "ORDER BY city.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(district, "District");
+        return query(CITY_SELECT + "WHERE city.District = ? " + "ORDER BY city.Population DESC, city.ID",
+                App::readCity, district);
     }
 
-    /**
-     * Retrieves details for the top cities in the world and stores them in an ArrayList.
-     * @param n - The number to get
-     * @return cities
-     */
+    /** Returns the top N cities in the world, ordered by descending population. */
     public ArrayList<City> getTopCities(Integer n) {
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "ORDER BY city.Population DESC " +
-                    "LIMIT " + n + ";";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireLimit(n);
+        return query(CITY_SELECT + "ORDER BY city.Population DESC, city.ID LIMIT ?",
+                App::readCity, n);
     }
 
-    /**
-     * Retrieves details for the top cities in a continent and stores them in an ArrayList.
-     * @param n - The number to display
-     * @param continent - the continent to filter by
-     * @return cities
-     */
+    /** Returns the top N cities in a continent, ordered by descending population. */
     public ArrayList<City> getTopCitiesByContinent(String continent, Integer n) {
-        if(continent == null)
-        {
-            System.out.println("Continent is null");
-            return null;
-        }
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "WHERE country.Continent = '" + continent + "' " +
-                    "ORDER BY city.Population DESC " +
-                    "LIMIT " + n + ";";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(continent, "Continent");
+        requireLimit(n);
+        return query(CITY_SELECT + "WHERE country.Continent = ? " + "ORDER BY city.Population DESC, city.ID LIMIT ?",
+                App::readCity, continent, n);
     }
 
-    /**
-     * Retrieves details for all cities in a region and stores them in an ArrayList.
-     * @param n - the number to display
-     * @param region - the continent to filter by
-     * @return cities
-     */
+    /** Returns the top N cities in a region, ordered by descending population. */
     public ArrayList<City> getTopCitiesByRegion(String region, Integer n) {
-        if(region == null)
-        {
-            System.out.println("Region is null");
-            return null;
-        }
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "WHERE country.Region = '" + region + "' " +
-                    "ORDER BY city.Population DESC " +
-                    "LIMIT " + n + ";";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(region, "Region");
+        requireLimit(n);
+        return query(CITY_SELECT + "WHERE country.Region = ? " + "ORDER BY city.Population DESC, city.ID LIMIT ?",
+                App::readCity, region, n);
     }
 
-    /**
-     * Retrieves details for the top cities in a country and stores them in an ArrayList.
-     * @param n - the number to display
-     * @param country - the continent to filter by
-     * @return cities
-     */
+    /** Returns the top N cities in a country, ordered by descending population. */
     public ArrayList<City> getTopCitiesByCountry(String country, Integer n) {
-        if(country == null)
-        {
-            System.out.println("Country is null");
-            return null;
-        }
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "WHERE country.Name = '" + country + "' " +
-                    "ORDER BY city.Population DESC " +
-                    "LIMIT " + n + ";";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(country, "Country");
+        requireLimit(n);
+        return query(CITY_SELECT + "WHERE country.Name = ? " + "ORDER BY city.Population DESC, city.ID LIMIT ?",
+                App::readCity, country, n);
     }
 
-    /**
-     * Retrieves details for the top cities in a district and stores them in an ArrayList.
-     * @param n - the number to display
-     * @param district - the continent to filter by
-     * @return cities
-     */
+    /** Returns the top N cities in a district, ordered by descending population. */
     public ArrayList<City> getTopCitiesByDistrict(String district, Integer n) {
-        if(district == null)
-        {
-            System.out.println("District is null");
-            return null;
-        }
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.District, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "WHERE city.District = '" + district + "' " +
-                    "ORDER BY city.Population DESC " +
-                    "LIMIT " + n + ";";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.district = rset.getString("District");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(district, "District");
+        requireLimit(n);
+        return query(CITY_SELECT + "WHERE city.District = ? " + "ORDER BY city.Population DESC, city.ID LIMIT ?",
+                App::readCity, district, n);
     }
 
-    /**
-     * Prints a list of cities.
-     * @param cities The list of cities to print.
-     */
-    public void printCities(ArrayList<City> cities) {
-        // Check countries is not null.
-        if (cities == null) {
-            System.out.println("No cities in list.");
-            return;
-        }
-        else if(cities.isEmpty())
-        {
-            System.out.println("No cities in list.");
-            return;
-        }
-
-        // Print header.
-        System.out.println(String.format("%-40s %-40s %-20s %-20s", "Name", "Country", "District", "Population"));
-
-        // Loop over all countries in the list.
-        for (City city : cities) {
-            if (city == null)
-                continue;
-
-            String country_string = String.format("%-40s %-40s %-20s %-20s",
-                    city.name, city.country_name, city.district, city.population);
-            System.out.println(country_string);
-        }
-    }
-
-    /**
-     * Retrieves details for all capital cities in the world and stores them in an ArrayList.
-     * @return cities
-     */
+    /** Returns all capital cities in the world, ordered by descending population. */
     public ArrayList<City> getAllCapitalCities() {
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.ID = country.Capital " +
-                    "ORDER BY city.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        return query(CAPITAL_SELECT + "ORDER BY city.Population DESC, city.ID",
+                App::readCity);
     }
 
-    /**
-     * Retrieves details for all capital cities in a continent and stores them in an ArrayList.
-     * @param continent - the continent to filter by
-     * @return cities
-     */
+    /** Returns capital cities in a continent, ordered by descending population. */
     public ArrayList<City> getCapCitiesByContinent(String continent) {
-        if(continent == null)
-        {
-            System.out.println("Continent is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.ID = country.Capital " +
-                    "WHERE country.Continent = '" + continent + "' " +
-                    "ORDER BY city.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(continent, "Continent");
+        return query(CAPITAL_SELECT + "WHERE country.Continent = ? " + "ORDER BY city.Population DESC, city.ID",
+                App::readCity, continent);
     }
 
-    /**
-     * Retrieves details for all capital cities in a region and stores them in an ArrayList.
-     * @param region - the continent to filter by
-     * @return cities
-     */
+    /** Returns capital cities in a region, ordered by descending population. */
     public ArrayList<City> getCapCitiesByRegion(String region) {
-        if(region == null)
-        {
-            System.out.println("Region is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.ID = country.Capital " +
-                    "WHERE country.Region = '" + region + "' " +
-                    "ORDER BY city.Population DESC;";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(region, "Region");
+        return query(CAPITAL_SELECT + "WHERE country.Region = ? " + "ORDER BY city.Population DESC, city.ID",
+                App::readCity, region);
     }
 
-    /**
-     * Retrieves details for the top capital cities in the world and stores them in an ArrayList.
-     * @param n - The number to get
-     * @return cities
-     */
+    /** Returns the top N capital cities in the world, ordered by descending population. */
     public ArrayList<City> getTopCapCities(Integer n) {
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.CountryCode = country.code " +
-                    "ORDER BY city.Population DESC " +
-                    "LIMIT " + n + ";";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireLimit(n);
+        return query(CAPITAL_SELECT + "ORDER BY city.Population DESC, city.ID LIMIT ?",
+                App::readCity, n);
     }
 
-    /**
-     * Retrieves details for the top capital cities in a continent and stores them in an ArrayList.
-     * @param n - The number to display
-     * @param continent - the continent to filter by
-     * @return cities
-     */
+    /** Returns the top N capital cities in a continent, ordered by descending population. */
     public ArrayList<City> getTopCapCitiesByContinent(String continent, Integer n) {
-        if(continent == null)
-        {
-            System.out.println("District is null");
-            return null;
-        }
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.ID = country.Capital " +
-                    "WHERE country.Continent = '" + continent + "' " +
-                    "ORDER BY city.Population DESC " +
-                    "LIMIT " + n + ";";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.population = rset.getInt("Population");
-                cities.add(city);
-            }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
-        }
+        requireFilter(continent, "Continent");
+        requireLimit(n);
+        return query(CAPITAL_SELECT + "WHERE country.Continent = ? " + "ORDER BY city.Population DESC, city.ID LIMIT ?",
+                App::readCity, continent, n);
     }
 
-    /**
-     * Retrieves details for all cities in a region and stores them in an ArrayList.
-     * @param n - the number to display
-     * @param region - the continent to filter by
-     * @return cities
-     */
+    /** Returns the top N capital cities in a region, ordered by descending population. */
     public ArrayList<City> getTopCapCitiesByRegion(String region, Integer n) {
-        if(region == null)
-        {
-            System.out.println("Region is null");
-            return null;
+        requireFilter(region, "Region");
+        requireLimit(n);
+        return query(CAPITAL_SELECT + "WHERE country.Region = ? " + "ORDER BY city.Population DESC, city.ID LIMIT ?",
+                App::readCity, region, n);
+    }
+
+    @FunctionalInterface
+    private interface RowMapper<T> {
+        T read(ResultSet result) throws SQLException;
+    }
+
+    /** Binds user input as values and closes both JDBC resources on every path. */
+    private <T> ArrayList<T> query(String sql, RowMapper<T> mapper, Object... values) {
+        if (con == null) {
+            throw new IllegalStateException("Connect to the database before requesting reports");
         }
-        if(n == null)
-        {
-            System.out.println("Given number is null");
-            return null;
-        }
-        try {
-            Statement stmt = con.createStatement();
-
-            String strSelect = "SELECT city.Name, country.Name AS Country_name, city.Population " +
-                    "FROM city " +
-                    "JOIN country ON city.ID = country.Capital " +
-                    "WHERE country.Region = '" + region + "' " +
-                    "ORDER BY city.Population DESC " +
-                    "LIMIT " + n + ";";
-
-            ResultSet rset = stmt.executeQuery(strSelect);
-
-            ArrayList<City> cities = new ArrayList<>();
-            while (rset.next()) {
-                City city = new City();
-                city.name = rset.getString("Name");
-                city.country_name = rset.getString("Country_Name");
-                city.population = rset.getInt("Population");
-                cities.add(city);
+        try (PreparedStatement statement = con.prepareStatement(sql)) {
+            for (int i = 0; i < values.length; i++) {
+                statement.setObject(i + 1, values[i]);
             }
-            return cities;
-        } catch (Exception e) {
-            System.out.println(e.getMessage());
-            System.out.println("Failed to get city details.");
-            return null;
+            try (ResultSet result = statement.executeQuery()) {
+                ArrayList<T> rows = new ArrayList<>();
+                while (result.next()) {
+                    rows.add(mapper.read(result));
+                }
+                return rows;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Could not generate report", e);
         }
     }
 
-    /**
-     * Prints a list of capital cities.
-     * @param cCities The list of capital cities to print.
-     */
-    public void printCapCities(ArrayList<City> cCities) {
-        // Check cCities is not null.
-        if (cCities == null) {
+    private static Country readCountry(ResultSet result) throws SQLException {
+        Country country = new Country();
+        country.code = result.getString("Code");
+        country.name = result.getString("Name");
+        country.continent = result.getString("Continent");
+        country.region = result.getString("Region");
+        country.population = result.getInt("Population");
+        country.capital = result.getString("Capital");
+        return country;
+    }
+
+    private static City readCity(ResultSet result) throws SQLException {
+        City city = new City();
+        city.name = result.getString("Name");
+        city.country_name = result.getString("Country_name");
+        city.district = result.getString("District");
+        city.population = result.getInt("Population");
+        return city;
+    }
+
+    private static boolean hasRows(ArrayList<?> rows) {
+        return rows != null && rows.stream().anyMatch(Objects::nonNull);
+    }
+
+    private static String display(String text) {
+        return text == null ? "-" : text;
+    }
+
+    /** Prints the required country columns, ignoring missing list members. */
+    public void printCountries(ArrayList<Country> countries) {
+        if (!hasRows(countries)) {
+            System.out.println("No countries in list.");
+            return;
+        }
+        String format = "%-8s %-40s %-15s %-30s %-15s %-10s%n";
+        System.out.printf(format, "Code", "Name", "Continent", "Region", "Population", "Capital");
+        for (Country country : countries) {
+            if (country != null) {
+                System.out.printf(format, display(country.code), display(country.name),
+                        display(country.continent), display(country.region), country.population,
+                        display(country.capital));
+            }
+        }
+    }
+
+    /** Prints the required city columns, ignoring missing list members. */
+    public void printCities(ArrayList<City> cities) {
+        if (!hasRows(cities)) {
             System.out.println("No cities in list.");
             return;
         }
-        else if(cCities.isEmpty())
-        {
+        String format = "%-40s %-40s %-20s %-20s%n";
+        System.out.printf(format, "Name", "Country", "District", "Population");
+        for (City city : cities) {
+            if (city != null) {
+                System.out.printf(format, display(city.name), display(city.country_name),
+                        display(city.district), city.population);
+            }
+        }
+    }
+
+    /** Prints the required capital columns, ignoring missing list members. */
+    public void printCapCities(ArrayList<City> cities) {
+        if (!hasRows(cities)) {
             System.out.println("No cities in list.");
             return;
         }
-
-        // Print header.
-        System.out.println(String.format("%-40s %-40s %-20s", "Name", "Country", "Population"));
-
-        // Loop over all countries in the list.
-        for (City city : cCities) {
-            if (city == null)
-                continue;
-
-            String country_string = String.format("%-40s %-40s %-20s",
-                    city.name, city.country_name, city.population);
-            System.out.println(country_string);
+        String format = "%-40s %-40s %-20s%n";
+        System.out.printf(format, "Name", "Country", "Population");
+        for (City city : cities) {
+            if (city != null) {
+                System.out.printf(format, display(city.name), display(city.country_name), city.population);
+            }
         }
     }
 }
